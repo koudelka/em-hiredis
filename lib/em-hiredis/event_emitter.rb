@@ -1,29 +1,30 @@
 module EM::Hiredis
   module EventEmitter
+
     def on(event, &listener)
-      _listeners[event] << listener
+      listeners[event] << listener
     end
 
     def emit(event, *args)
-      _listeners[event].each { |l| l.call(*args) }
+      listeners[event].each { |l| l.call(*args) }
     end
 
     def remove_listener(event, &listener)
-      _listeners[event].delete(listener)
+      listeners[event].delete(listener)
     end
 
     def remove_all_listeners(event)
-      _listeners.delete(event)
+      listeners.delete(event)
     end
 
     def listeners(event)
-      _listeners[event]
+      listeners[event]
     end
 
-    private
-
-    def _listeners
-      @_listeners ||= Hash.new { |h,k| h[k] = [] }
+    def listeners
+      @listeners ||= Hash.new { |h,k| h[k] = [] }
     end
+    private :listeners
+
   end
 end

@@ -9,7 +9,7 @@ module EM
         @logger ||= begin
           require 'logger'
           log = Logger.new(STDOUT)
-          log.level = Logger::WARN
+          log.level = Logger::INFO
           log
         end
       end
@@ -17,6 +17,12 @@ module EM
   end
 end
 
+#
+# make sure we're reading from this directory before any installed versions
+#
+$:.unshift File.dirname(File.expand_path(__FILE__))
+
+require 'hiredis/reader'
 require 'em-hiredis/event_emitter'
 require 'em-hiredis/connection'
 require 'em-hiredis/client'

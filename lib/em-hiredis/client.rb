@@ -1,131 +1,175 @@
 module EM::Hiredis
   class Client
-    PUBSUB_MESSAGES = %w{message pmessage}.freeze
-
-    include EM::Hiredis::EventEmitter
+    include EventEmitter
     include EM::Deferrable
 
-    def self.connect(host = 'localhost', port = 6379)
-      new(host, port)
+    PUBSUB_MESSAGES = %w{message pmessage}.freeze
+    BOOLEAN_COMMANDS = [
+      :exists,
+      :expire,
+      :expireat,
+      :move,
+      :persist,
+      :renamenx
+    ]
+    SPECIAL_CASES = {}
+
+    def self.connect(args)
+      new(args)
     end
 
-    def initialize(host, port)
-      @host, @port = host, port
+    def initialize(args)
+      @host = args[:host] || 'localhost'
+      @port = args[:port] || 6379
+      @reconnect_secs = args[:reconnect_secs] || 1
       @subs, @psubs = [], []
       @defs = []
-      @connection = EM.connect(host, port, Connection, host, port)
+      @connection = EM.connect(@host, @port, Connection, @host, @port)
+      @state = :disconnected # can be :connected, :reconnecting, :pubsub or :disconnected
 
-      @connection.on(:closed) {
-        if @connected
-          @defs.each { |d| d.fail("Redis disconnected") }
+      @connection.on(:closed) do
+        if @state == :connected
+          @defs.each { |d| d.last.fail("Redis disconnected (#{@host}:#{@port}), reconnecting in #{@reconnect_secs} seconds.") }
           @defs = []
           @deferred_status = nil
-          @connected = false
-          @reconnecting = true
           reconnect
         else
-          EM.add_timer(1) { reconnect }
+          EM.add_timer(@reconnect_secs) { reconnect }
         end
-      }
+      end
 
-      @connection.on(:connected) {
-        @connected = true
+      @connection.on(:connected) do
+        state_was = @state
+        @state = :connected
+
         select(@db) if @db
         @subs.each { |s| method_missing(:subscribe, s) }
         @psubs.each { |s| method_missing(:psubscribe, s) }
+
+        emit(:reconnected) if state_was == :reconnecting
         succeed
+      end
 
-        if @reconnecting
-          @reconnecting = false
-          emit(:reconnected)
-        end
-      }
+      @connection.on(:message) do |reply|
+        if @status == :pubsub
+          kind, subscription, d1, d2 = *reply
+          EM::Hiredis.logger.debug("PubSub mode reply: #{reply.inspect}")
 
-      @connection.on(:message) { |reply|
-        if RuntimeError === reply
-          raise "Replies out of sync: #{reply.inspect}" if @defs.empty?
-          deferred = @defs.shift
-          deferred.fail(reply) if deferred
-        else
-          if reply && PUBSUB_MESSAGES.include?(reply[0]) # reply can be nil
-            kind, subscription, d1, d2 = *reply
-
-            case kind.to_sym
+          case kind.to_sym
             when :message
               emit(:message, subscription, d1)
             when :pmessage
               emit(:pmessage, subscription, d1, d2)
-            end
+          end
+        else
+          raise "Replies out of sync: #{reply.inspect}" if @defs.empty?
+
+          command, deferred = @defs.shift
+          reply = reply > 0 if BOOLEAN_COMMANDS.include?(command)
+
+          EM::Hiredis.logger.debug("Normal mode reply: #{command} -> #{reply}")
+
+          if RuntimeError === reply
+            deferred.fail(reply) if deferred
           else
-            raise "Replies out of sync: #{reply.inspect}" if @defs.empty?
-            deferred = @defs.shift
             deferred.succeed(reply) if deferred
           end
         end
-      }
-
-      @connected = false
-      @reconnecting = false
+      end
     end
 
-    # Indicates that commands have been sent to redis but a reply has not yet 
+    # Indicates that commands have been sent to redis but a reply has not yet
     # been received.
-    # 
-    # This can be useful for example to avoid stopping the 
+    #
+    # This can be useful for example to avoid stopping the
     # eventmachine reactor while there are outstanding commands
-    # 
+    #
     def pending_commands?
-      @connected && @defs.size > 0
+      @state == :connected && @defs.size > 0
     end
 
-    def subscribe(channel)
-      @subs << channel
-      method_missing(:subscribe, channel)
+    #
+    # Commands that need special treatment before being sent.
+    #
+
+    def self.special_case(sym, &block)
+      SPECIAL_CASES[sym] = block
     end
 
-    def unsubscribe(channel)
-      @subs.delete(channel)
-      method_missing(:unsubscribe, channel)
+    special_case :sort do |key, options|
+      [key] + \
+        options.collect do |option, value|
+          case option.to_sym
+            when :get
+              [*value].collect { |get| ['get', get] }
+            when :by, :limit, :store
+              [option, value]
+            when :order
+              value
+            else
+             option
+          end
+        end
     end
 
-    def psubscribe(channel)
-      @psubs << channel
-      method_missing(:psubscribe, channel)
-    end
-
-    def punsubscribe(channel)
-      @psubs.delete(channel)
-      method_missing(:punsubscribe, channel)
-    end
-
-    def select(db)
+    special_case :select do |db|
       @db = db
-      method_missing(:select, db)
     end
 
-    def method_missing(sym, *args)
+    special_case :subscribe do |channel|
+      @subs << channel
+      channel
+    end
+
+    special_case :subscribe do |channel|
+      @subs << channel
+      channel
+    end
+
+    special_case :unsubscribe do |channel|
+      @subs.delete(channel)
+    end
+
+    special_case :psubscribe do |channel|
+      @psubs << channel
+      channel
+    end
+
+    special_case :punsubscribe do |channel|
+      @psubs.delete(channel)
+    end
+
+
+    def method_missing(sym, *args, &block)
+      sym = sym.to_s.downcase.to_sym
+
+      args = SPECIAL_CASES[sym].call(*args) if SPECIAL_CASES[sym]
+      args = [*args].collect { |o| o.respond_to?(:flatten) ? o.flatten : o }.flatten # necessary to flatten both hashes and arrays
+
       deferred = EM::DefaultDeferrable.new
       # Shortcut for defining the callback case with just a block
-      deferred.callback { |result| yield(result) } if block_given?
+      deferred.callback(&block) if block_given?
 
-      if @connected
+      if @state == :connected
         @connection.send_command(sym, *args)
-        @defs.push(deferred)
+        @defs.push([sym, deferred])
       else
-        callback {
+        callback do
           @connection.send_command(sym, *args)
-          @defs.push(deferred)
-        }
+          @defs.push([sym, deferred])
+        end
       end
 
-      return deferred
+      deferred
     end
 
-    private
 
     def reconnect
-      EM::Hiredis.logger.debug("Trying to reconnect to Redis")
+      EM::Hiredis.logger.debug("Trying to reconnect to Redis (#{@host}:#{@port})")
+      @state = :reconnecting
       @connection.reconnect @host, @port
     end
+    private :reconnect
+
   end
 end
