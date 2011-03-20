@@ -4,14 +4,19 @@ module EM::Hiredis
     include EM::Deferrable
 
     PUBSUB_MESSAGES = %w{message pmessage}.freeze
-    BOOLEAN_COMMANDS = [
+    BOOLEAN_RESPONSES = [
       :exists,
       :expire,
       :expireat,
+      :hdel,
+      :hexists,
+      :hset,
+      :hsetnx,
       :move,
       :persist,
-      :renamenx
+      :renamenx,
     ]
+
     SPECIAL_CASES = {}
 
     def self.connect(args)
@@ -65,7 +70,8 @@ module EM::Hiredis
           raise "Replies out of sync: #{reply.inspect}" if @defs.empty?
 
           command, deferred = @defs.shift
-          reply = reply > 0 if BOOLEAN_COMMANDS.include?(command)
+
+          reply = reply > 0  if BOOLEAN_RESPONSES.include?(command)
 
           EM::Hiredis.logger.debug("Normal mode reply: #{command} -> #{reply}")
 
